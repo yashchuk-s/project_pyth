@@ -1,315 +1,199 @@
-import re
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 import matplotlib.pyplot as plt
 import numpy as np
-import sympy as sp
+
+from PIL import Image, ImageTk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from scipy.integrate import solve_ivp
-from sympy.parsing.sympy_parser import (
-    parse_expr,
-    standard_transformations,
-    implicit_multiplication_application,
-    convert_xor,
+
+from solver import (
+    BVPProblem,
+    solve_bvp_by_continuation,
 )
 
-from solver import continuation_method_with_jacobian
-
-
-TRANSFORMATIONS = standard_transformations + (
-    implicit_multiplication_application,
-    convert_xor,
+from project_data import (
+    GRAPH_COLORS,
+    AUTHOR_PHOTO_PATH,
+    translate,
+    get_example_oscillator,
+    get_example_two_body_1,
+    get_example_two_body_2,
+    get_example_three_body,
 )
 
-
-def get_allowed_functions():
-    return {
-        "sin": sp.sin,
-        "cos": sp.cos,
-        "tan": sp.tan,
-        "asin": sp.asin,
-        "acos": sp.acos,
-        "atan": sp.atan,
-        "sinh": sp.sinh,
-        "cosh": sp.cosh,
-        "tanh": sp.tanh,
-        "exp": sp.exp,
-        "log": sp.log,
-        "ln": sp.log,
-        "sqrt": sp.sqrt,
-        "abs": sp.Abs,
-        "pi": sp.pi,
-        "E": sp.E,
-    }
+from parser import parse_float_list
 
 
-def parse_float_list(text, expected_size=None, field_name="список"):
-    try:
-        values = [float(item.strip()) for item in text.split(",") if item.strip()]
-    except ValueError as exc:
-        raise ValueError(f"Некорректный ввод в поле '{field_name}'.") from exc
 
-    if expected_size is not None and len(values) != expected_size:
-        raise ValueError(
-            f"Поле '{field_name}' должно содержать {expected_size} чисел. "
-            f"Сейчас введено: {len(values)}."
-        )
+try:
+    plt.style.use("seaborn-v0_8-darkgrid")
+except OSError:
+    pass
 
-    return np.asarray(values, dtype=float)
-
-
-def build_ode_functions(equation_strings, n):
-    t_symbol = sp.Symbol("t")
-    y_symbols = sp.symbols(f"y1:{n + 1}")
-
-    local_dict = get_allowed_functions()
-    local_dict["t"] = t_symbol
-
-    for symbol in y_symbols:
-        local_dict[str(symbol)] = symbol
-
-    expressions = []
-
-    for index, equation in enumerate(equation_strings, start=1):
-        equation = equation.strip()
-
-        if not equation:
-            raise ValueError(f"Пустая строка в уравнении номер {index}.")
-
-        try:
-            expression = parse_expr(
-                equation,
-                local_dict=local_dict,
-                transformations=TRANSFORMATIONS,
-                evaluate=True,
-            )
-        except Exception as exc:
-            raise ValueError(
-                f"Не удалось разобрать уравнение {index}: '{equation}'."
-            ) from exc
-
-        expressions.append(expression)
-
-    vector_expression = sp.Matrix(expressions)
-    jacobian_expression = vector_expression.jacobian(y_symbols)
-
-    numeric_f = sp.lambdify((t_symbol, *y_symbols), expressions, "numpy")
-    numeric_jacobian = sp.lambdify(
-        (t_symbol, *y_symbols),
-        jacobian_expression,
-        "numpy",
-    )
-
-    def f(t, y):
-        values = numeric_f(t, *y)
-        return np.asarray(values, dtype=float).reshape(n)
-
-    def f_jacobian(t, y):
-        values = numeric_jacobian(t, *y)
-        return np.asarray(values, dtype=float).reshape(n, n)
-
-    return f, f_jacobian
-
-
-def replace_boundary_variables(expression, a, b, n):
-    pattern = r"y(\d+)\s*\(\s*([^)]+)\s*\)"
-
-    def replacement(match):
-        variable_index = int(match.group(1))
-        point = match.group(2).strip()
-
-        if variable_index < 1 or variable_index > n:
-            raise ValueError(
-                f"В граничном условии использована переменная y{variable_index}, "
-                f"но размерность системы n={n}."
-            )
-
-        if point == "a":
-            return f"ya{variable_index}"
-
-        if point == "b":
-            return f"yb{variable_index}"
-
-        try:
-            point_value = float(point)
-        except ValueError as exc:
-            raise ValueError(
-                f"В записи '{match.group(0)}' точка должна быть a, b "
-                f"или числом, равным одному из концов интервала."
-            ) from exc
-
-        if np.isclose(point_value, a):
-            return f"ya{variable_index}"
-
-        if np.isclose(point_value, b):
-            return f"yb{variable_index}"
-
-        raise ValueError(
-            f"Граничные условия можно задавать только в концах интервала. "
-            f"a={a}, b={b}, получено: {point_value}."
-        )
-
-    return re.sub(pattern, replacement, expression)
-
-
-def build_boundary_functions(boundary_condition_strings, n, a, b):
-    if len(boundary_condition_strings) != n:
-        raise ValueError(
-            f"Количество граничных условий должно быть равно n={n}. "
-            f"Сейчас задано: {len(boundary_condition_strings)}."
-        )
-
-    ya_symbols = sp.symbols(f"ya1:{n + 1}")
-    yb_symbols = sp.symbols(f"yb1:{n + 1}")
-
-    local_dict = get_allowed_functions()
-    local_dict["a"] = float(a)
-    local_dict["b"] = float(b)
-
-    for symbol in ya_symbols:
-        local_dict[str(symbol)] = symbol
-
-    for symbol in yb_symbols:
-        local_dict[str(symbol)] = symbol
-
-    residual_expressions = []
-
-    for index, condition in enumerate(boundary_condition_strings, start=1):
-        condition_original = condition
-        condition = condition.strip().replace(" ", "")
-
-        if not condition:
-            raise ValueError(f"Пустое граничное условие номер {index}.")
-
-        if condition.count("=") != 1:
-            raise ValueError(
-                f"В граничном условии номер {index} должен быть ровно один знак '='. "
-                f"Получено: {condition_original}"
-            )
-
-        left, right = condition.split("=")
-
-        left = replace_boundary_variables(left, a, b, n)
-        right = replace_boundary_variables(right, a, b, n)
-
-        try:
-            left_expr = parse_expr(
-                left,
-                local_dict=local_dict,
-                transformations=TRANSFORMATIONS,
-                evaluate=True,
-            )
-            right_expr = parse_expr(
-                right,
-                local_dict=local_dict,
-                transformations=TRANSFORMATIONS,
-                evaluate=True,
-            )
-        except Exception as exc:
-            raise ValueError(
-                f"Не удалось разобрать граничное условие {index}: "
-                f"'{condition_original}'."
-            ) from exc
-
-        residual_expressions.append(left_expr - right_expr)
-
-    residual_matrix = sp.Matrix(residual_expressions)
-    jacobian_ya_expression = residual_matrix.jacobian(ya_symbols)
-    jacobian_yb_expression = residual_matrix.jacobian(yb_symbols)
-
-    numeric_residual = sp.lambdify(
-        (*ya_symbols, *yb_symbols),
-        residual_expressions,
-        "numpy",
-    )
-
-    numeric_jacobian_ya = sp.lambdify(
-        (*ya_symbols, *yb_symbols),
-        jacobian_ya_expression,
-        "numpy",
-    )
-
-    numeric_jacobian_yb = sp.lambdify(
-        (*ya_symbols, *yb_symbols),
-        jacobian_yb_expression,
-        "numpy",
-    )
-
-    def boundary_residual(ya, yb):
-        args = list(ya) + list(yb)
-        values = numeric_residual(*args)
-        return np.asarray(values, dtype=float).reshape(n)
-
-    def boundary_jacobian(ya, yb):
-        args = list(ya) + list(yb)
-
-        jacobian_ya = numeric_jacobian_ya(*args)
-        jacobian_yb = numeric_jacobian_yb(*args)
-
-        jacobian_ya = np.asarray(jacobian_ya, dtype=float).reshape(n, n)
-        jacobian_yb = np.asarray(jacobian_yb, dtype=float).reshape(n, n)
-
-        return jacobian_ya, jacobian_yb
-
-    return boundary_residual, boundary_jacobian
+plt.rcParams.update({"font.size": 11})
 
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Решение краевых задач методом продолжения")
+        self.language = "ru"
+
+        self.root.title(self.tr("Решение краевых задач методом продолжения"))
         self.root.geometry("1200x720")
         self.root.minsize(1050, 620)
 
         self.worker_thread = None
         self.current_solution = None
+        self.author_photo_image = None
 
         self.create_menu()
         self.create_layout()
-        self.load_example_two_body_1()
+        self.load_example_oscillator()
         self.bind_hotkeys()
+
+    def tr(self, text):
+        return translate(self.language, text)
+
+    def change_language(self, language):
+        self.language = language
+        self.root.title(self.tr("Решение краевых задач методом продолжения"))
+
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        self.create_menu()
+        self.create_layout()
+        self.load_example_oscillator()
+
+    def get_graph_color(self):
+        selected_color = self.graph_color_var.get()
+
+        for russian_name, matplotlib_color in GRAPH_COLORS.items():
+            if selected_color == russian_name or selected_color == self.tr(russian_name):
+                return matplotlib_color
+
+        return "C0"
+
+
+    def get_component_color(self, index):
+        if not hasattr(self, "component_color_vars"):
+            return f"C{index % 10}"
+
+        if index >= len(self.component_color_vars):
+            return f"C{index % 10}"
+
+        selected_color = self.component_color_vars[index].get()
+
+        for russian_name, matplotlib_color in GRAPH_COLORS.items():
+            if selected_color == russian_name or selected_color == self.tr(russian_name):
+                return matplotlib_color
+
+        return f"C{index % 10}"
+
+    def update_component_color_fields(self, n):
+        for widget in self.component_color_frame.winfo_children():
+            widget.destroy()
+
+        self.component_color_vars = []
+
+        color_names = list(GRAPH_COLORS.keys())
+        translated_color_names = [self.tr(color_name) for color_name in color_names]
+
+        for i in range(n):
+            row = ttk.Frame(self.component_color_frame)
+            row.pack(fill=tk.X, pady=2, padx=5)
+
+            ttk.Label(
+                row,
+                text=f"{self.tr('Цвет')} y{i + 1}",
+                width=12,
+            ).pack(side=tk.LEFT)
+
+            default_color_name = color_names[i % len(color_names)]
+            color_var = tk.StringVar(value=self.tr(default_color_name))
+
+            color_combo = ttk.Combobox(
+                row,
+                textvariable=color_var,
+                values=translated_color_names,
+                state="readonly",
+                width=18,
+            )
+            color_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            color_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda event: self.redraw_current_solution(),
+            )
+
+            self.component_color_vars.append(color_var)
 
     def create_menu(self):
         menubar = tk.Menu(self.root)
 
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(
-            label="Сохранить график",
+            label=self.tr("Сохранить график"),
             accelerator="Ctrl+G",
             command=self.save_graph,
         )
-        menubar.add_cascade(label="Файл", menu=file_menu)
+        menubar.add_cascade(label=self.tr("Файл"), menu=file_menu)
 
         solution_menu = tk.Menu(menubar, tearoff=0)
         solution_menu.add_command(
-            label="Решить задачу",
+            label=self.tr("Решить задачу"),
             accelerator="Ctrl+R",
             command=self.start_solving,
         )
-        menubar.add_cascade(label="Решение", menu=solution_menu)
+        menubar.add_cascade(label=self.tr("Решение"), menu=solution_menu)
 
         examples_menu = tk.Menu(menubar, tearoff=0)
         examples_menu.add_command(
-            label="Пример 26.1: задача двух тел, решение 1",
+            label=self.tr("Простой осциллятор"),
+            accelerator="Ctrl+0",
+            command=self.load_example_oscillator,
+        )
+        examples_menu.add_command(
+            label=self.tr("Пример 26.1: задача двух тел, решение 1"),
             accelerator="Ctrl+1",
             command=self.load_example_two_body_1,
         )
         examples_menu.add_command(
-            label="Пример 26.1: задача двух тел, решение 2",
+            label=self.tr("Пример 26.1: задача двух тел, решение 2"),
             accelerator="Ctrl+2",
             command=self.load_example_two_body_2,
         )
-        menubar.add_cascade(label="Примеры", menu=examples_menu)
-
-        about_menu = tk.Menu(menubar, tearoff=0)
-        about_menu.add_command(
-            label="О программе",
-            command=self.show_about,
+        examples_menu.add_command(
+            label=self.tr("Контрольный пример: система из трёх уравнений"),
+            accelerator="Ctrl+3",
+            command=self.load_example_three_body,
         )
-        menubar.add_cascade(label="Об авторе", menu=about_menu)
+        menubar.add_cascade(label=self.tr("Примеры"), menu=examples_menu)
+
+        language_menu = tk.Menu(menubar, tearoff=0)
+        language_menu.add_command(
+            label=self.tr("Русский"),
+            command=lambda: self.change_language("ru"),
+        )
+        language_menu.add_command(
+            label=self.tr("Английский"),
+            command=lambda: self.change_language("en"),
+        )
+        menubar.add_cascade(label=self.tr("Язык"), menu=language_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(
+            label=self.tr("О программе"),
+            command=self.show_program_info,
+        )
+        help_menu.add_command(
+            label=self.tr("Об авторе"),
+            command=self.show_author_info,
+        )
+        menubar.add_cascade(label=self.tr("Справка"), menu=help_menu)
 
         self.root.config(menu=menubar)
 
@@ -341,11 +225,13 @@ class App:
 
         ttk.Label(
             self.scroll_frame,
-            text="Параметры краевой задачи",
+            text=self.tr("Параметры краевой задачи"),
             font=("Segoe UI", 11, "bold"),
         ).pack(anchor="w", pady=(0, 8))
 
-        ttk.Label(self.scroll_frame, text="Размерность системы n").pack(anchor="w")
+        ttk.Label(self.scroll_frame, text=self.tr("Размерность системы n")).pack(
+            anchor="w"
+        )
 
         dim_frame = ttk.Frame(self.scroll_frame)
         dim_frame.pack(fill=tk.X, pady=3)
@@ -355,26 +241,28 @@ class App:
 
         ttk.Button(
             dim_frame,
-            text="Применить",
+            text=self.tr("Применить"),
             command=self.update_fields,
         ).pack(side=tk.LEFT, padx=8)
 
         self.eq_frame = ttk.LabelFrame(
             self.scroll_frame,
-            text="Система ОДУ: правые части y' = f(t, y)",
+            text=self.tr("Система ОДУ: правые части y' = f(t, y)"),
         )
         self.eq_frame.pack(fill=tk.X, pady=10)
 
         self.bc_frame = ttk.LabelFrame(
             self.scroll_frame,
-            text="Граничные условия",
+            text=self.tr("Граничные условия"),
         )
         self.bc_frame.pack(fill=tk.X, pady=10)
 
         self.eq_entries = []
         self.bc_entries = []
 
-        ttk.Label(self.scroll_frame, text="Интервал [a, b]").pack(anchor="w")
+        ttk.Label(self.scroll_frame, text=self.tr("Интервал [a, b]")).pack(
+            anchor="w"
+        )
 
         interval_frame = ttk.Frame(self.scroll_frame)
         interval_frame.pack(fill=tk.X, pady=3)
@@ -387,58 +275,240 @@ class App:
 
         ttk.Label(
             self.scroll_frame,
-            text="Начальное приближение p0 = y(a)",
+            text=self.tr("Точка t* для параметра p = y(t*)"),
+        ).pack(anchor="w", pady=(8, 0))
+
+        self.t_star_entry = ttk.Entry(self.scroll_frame)
+        self.t_star_entry.pack(fill=tk.X, pady=3)
+
+        ttk.Label(
+            self.scroll_frame,
+            text=self.tr("Начальное приближение p0 = y(t*)"),
         ).pack(anchor="w", pady=(8, 0))
 
         self.p0_entry = ttk.Entry(self.scroll_frame)
         self.p0_entry.pack(fill=tk.X, pady=3)
 
-        ttk.Label(self.scroll_frame, text="Число шагов по параметру mu").pack(
-            anchor="w", pady=(8, 0)
-        )
+        ttk.Label(
+            self.scroll_frame,
+            text=self.tr("Число шагов по параметру mu"),
+        ).pack(anchor="w", pady=(8, 0))
 
         self.steps_entry = ttk.Entry(self.scroll_frame)
         self.steps_entry.pack(fill=tk.X, pady=3)
 
-        ttk.Label(self.scroll_frame, text="Максимальное число итераций").pack(
-            anchor="w", pady=(8, 0)
-        )
+        ttk.Label(
+            self.scroll_frame,
+            text=self.tr("Максимальное число итераций"),
+        ).pack(anchor="w", pady=(8, 0))
 
         self.max_iter_entry = ttk.Entry(self.scroll_frame)
         self.max_iter_entry.pack(fill=tk.X, pady=3)
 
-        ttk.Label(self.scroll_frame, text="Точность").pack(anchor="w", pady=(8, 0))
+        ttk.Label(self.scroll_frame, text=self.tr("Точность")).pack(
+            anchor="w", pady=(8, 0)
+        )
 
         self.tolerance_entry = ttk.Entry(self.scroll_frame)
         self.tolerance_entry.pack(fill=tk.X, pady=3)
 
+        ttk.Label(self.scroll_frame, text=self.tr("Тип графика")).pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        self.plot_mode_var = tk.StringVar(value=self.tr("Фазовый график"))
+        self.plot_mode_combo = ttk.Combobox(
+            self.scroll_frame,
+            textvariable=self.plot_mode_var,
+            values=[
+                self.tr("Фазовый график"),
+                self.tr("Компоненты y_i(t)"),
+            ],
+            state="readonly",
+        )
+
+        self.plot_mode_combo.pack(fill=tk.X, pady=3)
+        self.plot_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.redraw_current_solution(),
+        )
+        ttk.Label(self.scroll_frame, text=self.tr("Цвет графика")).pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        self.graph_color_var = tk.StringVar(value=self.tr("Синий"))
+        self.graph_color_combo = ttk.Combobox(
+            self.scroll_frame,
+            textvariable=self.graph_color_var,
+            values=[self.tr(color_name) for color_name in GRAPH_COLORS.keys()],
+            state="readonly",
+        )
+        self.graph_color_combo.pack(fill=tk.X, pady=3)
+        self.graph_color_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.redraw_current_solution(),
+        )
+
+        self.component_color_frame = ttk.LabelFrame(
+            self.scroll_frame,
+            text=self.tr("Цвета компонент y_i(t)"),
+        )
+        self.component_color_frame.pack(fill=tk.X, pady=10)
+
+        self.component_color_vars = []
+
+        ttk.Label(self.scroll_frame, text=self.tr("Ось X фазового графика")).pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        self.phase_x_var = tk.StringVar(value="y1")
+        self.phase_x_combo = ttk.Combobox(
+            self.scroll_frame,
+            textvariable=self.phase_x_var,
+            values=["y1", "y2", "y3", "y4"],
+            state="readonly",
+        )
+        self.phase_x_combo.pack(fill=tk.X, pady=3)
+        self.phase_x_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.redraw_current_solution(),
+        )
+
+        ttk.Label(self.scroll_frame, text=self.tr("Ось Y фазового графика")).pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        self.phase_y_var = tk.StringVar(value="y2")
+        self.phase_y_combo = ttk.Combobox(
+            self.scroll_frame,
+            textvariable=self.phase_y_var,
+            values=["y1", "y2", "y3", "y4"],
+            state="readonly",
+        )
+        self.phase_y_combo.pack(fill=tk.X, pady=3)
+        self.phase_y_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.redraw_current_solution(),
+        )
+
         self.solve_button = ttk.Button(
             self.scroll_frame,
-            text="Решить задачу",
+            text=self.tr("Решить задачу"),
             command=self.start_solving,
         )
         self.solve_button.pack(fill=tk.X, pady=(10, 4))
 
         ttk.Button(
             self.scroll_frame,
-            text="Сохранить график",
+            text=self.tr("Сохранить график"),
             command=self.save_graph,
         ).pack(fill=tk.X, pady=4)
 
         self.status_label = ttk.Label(
             self.scroll_frame,
-            text="Готово.",
+            text=self.tr("Готово."),
             wraplength=410,
         )
         self.status_label.pack(anchor="w", pady=8)
 
+        self.notebook = ttk.Notebook(right_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.graph_tab = ttk.Frame(self.notebook)
+        self.table_tab = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.graph_tab, text=self.tr("График"))
+        self.notebook.add(self.table_tab, text=self.tr("Таблица mu"))
+
         self.figure = plt.Figure(figsize=(7, 5))
         self.ax = self.figure.add_subplot(111)
 
-        self.canvas_plot = FigureCanvasTkAgg(self.figure, master=right_frame)
+        self.canvas_plot = FigureCanvasTkAgg(self.figure, master=self.graph_tab)
         self.canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+        table_frame = ttk.Frame(self.table_tab, padding=8)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.mu_table = ttk.Treeview(
+            table_frame,
+            show="headings",
+        )
+
+        table_scrollbar_y = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.mu_table.yview,
+        )
+
+        table_scrollbar_x = ttk.Scrollbar(
+            table_frame,
+            orient="horizontal",
+            command=self.mu_table.xview,
+        )
+
+        self.mu_table.configure(
+            yscrollcommand=table_scrollbar_y.set,
+            xscrollcommand=table_scrollbar_x.set,
+        )
+
+        self.mu_table.grid(row=0, column=0, sticky="nsew")
+        table_scrollbar_y.grid(row=0, column=1, sticky="ns")
+        table_scrollbar_x.grid(row=1, column=0, sticky="ew")
+
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        self.clear_mu_table()
+
+    def clear_mu_table(self):
+        for item in self.mu_table.get_children():
+            self.mu_table.delete(item)
+
+        self.mu_table["columns"] = ["message"]
+        self.mu_table.heading("message", text=self.tr("Сообщение"))
+        self.mu_table.column("message", width=500, anchor="center")
+        self.mu_table.insert(
+            "",
+            tk.END,
+            values=[self.tr("Таблица появится после решения задачи.")],
+        )
+
+    def update_mu_table(self, result_data):
+        for item in self.mu_table.get_children():
+            self.mu_table.delete(item)
+
+        history = getattr(result_data, "continuation_history", [])
+
+        if not history:
+            self.mu_table["columns"] = ["message"]
+            self.mu_table.heading("message", text=self.tr("Сообщение"))
+            self.mu_table.column("message", width=500, anchor="center")
+            self.mu_table.insert(
+                "",
+                tk.END,
+                values=[self.tr("Нет данных по шагам mu.")],
+            )
+            return
+
+        p_size = len(history[0]["p"])
+        columns = ["iteration", "mu"] + [f"p{i + 1}" for i in range(p_size)]
+
+        self.mu_table["columns"] = columns
+
+        for column in columns:
+            self.mu_table.heading(column, text=column)
+            self.mu_table.column(column, width=110, anchor="center", stretch=True)
+
+        for row_data in history:
+            row = [
+                row_data["iteration"],
+                f"{row_data['mu']:.6g}",
+            ]
+            row.extend(f"{value:.10g}" for value in row_data["p"])
+            self.mu_table.insert("", tk.END, values=row)
+
     def bind_hotkeys(self):
+        self.root.bind("<Control-Key-0>", lambda event: self.load_example_oscillator())
         self.root.bind("<Control-r>", lambda event: self.start_solving())
         self.root.bind("<Control-R>", lambda event: self.start_solving())
         self.root.bind("<Control-Return>", lambda event: self.start_solving())
@@ -448,6 +518,22 @@ class App:
 
         self.root.bind("<Control-Key-1>", lambda event: self.load_example_two_body_1())
         self.root.bind("<Control-Key-2>", lambda event: self.load_example_two_body_2())
+        self.root.bind("<Control-Key-3>", lambda event: self.load_example_three_body())
+
+    def update_phase_variables(self, n):
+        values = [f"y{i + 1}" for i in range(n)]
+
+        self.phase_x_combo["values"] = values
+        self.phase_y_combo["values"] = values
+
+        if self.phase_x_var.get() not in values:
+            self.phase_x_var.set("y1")
+
+        if self.phase_y_var.get() not in values:
+            if n >= 2:
+                self.phase_y_var.set("y2")
+            else:
+                self.phase_y_var.set("y1")
 
     def update_fields(self):
         try:
@@ -456,8 +542,8 @@ class App:
                 raise ValueError
         except ValueError:
             messagebox.showerror(
-                "Ошибка",
-                "Размерность n должна быть натуральным числом.",
+                self.tr("Ошибка"),
+                self.tr("Размерность n должна быть натуральным числом."),
             )
             return
 
@@ -469,6 +555,9 @@ class App:
 
         self.eq_entries = []
         self.bc_entries = []
+
+        self.update_phase_variables(n)
+        self.update_component_color_fields(n)
 
         for i in range(n):
             row = ttk.Frame(self.eq_frame)
@@ -486,6 +575,12 @@ class App:
                 entry.insert(0, "-y1 / (y1**2 + y2**2)**(3/2)")
             elif n == 4 and i == 3:
                 entry.insert(0, "-y2 / (y1**2 + y2**2)**(3/2)")
+            elif n == 3 and i == 0:
+                entry.insert(0, "y2")
+            elif n == 3 and i == 1:
+                entry.insert(0, "-y1")
+            elif n == 3 and i == 2:
+                entry.insert(0, "-y3")
             elif n == 2 and i == 0:
                 entry.insert(0, "y2")
             elif n == 2 and i == 1:
@@ -512,6 +607,12 @@ class App:
                 entry.insert(0, "y1(b)=1.0738644361")
             elif n == 4 and i == 3:
                 entry.insert(0, "y2(b)=-1.0995343576")
+            elif n == 3 and i == 0:
+                entry.insert(0, "y1(a)=0")
+            elif n == 3 and i == 1:
+                entry.insert(0, "y2(a)=1")
+            elif n == 3 and i == 2:
+                entry.insert(0, "y3(b)=0.3678794412")
             elif n == 2 and i == 0:
                 entry.insert(0, "y1(a)=0")
             elif n == 2 and i == 1:
@@ -542,6 +643,9 @@ class App:
         self.b_entry.delete(0, tk.END)
         self.b_entry.insert(0, str(example["b"]))
 
+        self.t_star_entry.delete(0, tk.END)
+        self.t_star_entry.insert(0, str(example.get("t_star", example["a"])))
+
         self.p0_entry.delete(0, tk.END)
         self.p0_entry.insert(0, example["p0"])
 
@@ -554,81 +658,62 @@ class App:
         self.tolerance_entry.delete(0, tk.END)
         self.tolerance_entry.insert(0, str(example.get("tolerance", "1e-6")))
 
-        self.status_label.config(text=f"Загружен пример: {example['name']}")
+        plot_mode = example.get("plot_mode", "phase")
+        if plot_mode == "components":
+            self.plot_mode_var.set(self.tr("Компоненты y_i(t)"))
+        else:
+            self.plot_mode_var.set(self.tr("Фазовый график"))
+
+        self.phase_x_var.set(example.get("phase_x", "y1"))
+        self.phase_y_var.set(example.get("phase_y", "y2"))
+
+        self.clear_mu_table()
+        self.current_solution = None
+
+        self.status_label.config(
+            text=f"{self.tr('Загружен пример')}: {self.tr(example['name'])}"
+        )
+
+    def load_example_oscillator(self):
+        self.load_example(get_example_oscillator())
+
 
     def load_example_two_body_1(self):
-        example = {
-            "name": "Пример 26.1: задача двух тел, решение 1",
-            "n": 4,
-            "equations": [
-                "y3",
-                "y4",
-                "-y1 / (y1**2 + y2**2)**(3/2)",
-                "-y2 / (y1**2 + y2**2)**(3/2)",
-            ],
-            "boundary_conditions": [
-                "y1(a)=2",
-                "y2(a)=0",
-                "y1(b)=1.0738644361",
-                "y2(b)=-1.0995343576",
-            ],
-            "a": 0,
-            "b": 7,
-            "p0": "2, 0, -0.5, 0.5",
-            "steps": 120,
-            "max_iter": 20,
-            "tolerance": "1e-6",
-        }
+        self.load_example(get_example_two_body_1())
 
-        self.load_example(example)
 
     def load_example_two_body_2(self):
-        example = {
-            "name": "Пример 26.1: задача двух тел, решение 2",
-            "n": 4,
-            "equations": [
-                "y3",
-                "y4",
-                "-y1 / (y1**2 + y2**2)**(3/2)",
-                "-y2 / (y1**2 + y2**2)**(3/2)",
-            ],
-            "boundary_conditions": [
-                "y1(a)=2",
-                "y2(a)=0",
-                "y1(b)=1.0738644361",
-                "y2(b)=-1.0995343576",
-            ],
-            "a": 0,
-            "b": 7,
-            "p0": "2, 0, 0.5, -0.5",
-            "steps": 120,
-            "max_iter": 20,
-            "tolerance": "1e-6",
-        }
+        self.load_example(get_example_two_body_2())
 
-        self.load_example(example)
+
+    def load_example_three_body(self):
+        self.load_example(get_example_three_body())
 
     def start_solving(self):
         if self.worker_thread is not None and self.worker_thread.is_alive():
-            messagebox.showinfo("Расчёт", "Расчёт уже выполняется.")
+            messagebox.showinfo(
+                self.tr("Расчёт"),
+                self.tr("Расчёт уже выполняется."),
+            )
+            return
+
+        try:
+            problem = self.read_problem_from_form()
+        except Exception as exc:
+            messagebox.showerror(self.tr("Ошибка"), str(exc))
             return
 
         self.solve_button.config(state=tk.DISABLED)
-        self.status_label.config(text="Идёт расчёт...")
+        self.status_label.config(text=self.tr("Идёт расчёт..."))
 
-        self.worker_thread = threading.Thread(target=self.solve_worker, daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self.solve_worker,
+            args=(problem,),
+            daemon=True,
+        )
         self.worker_thread.start()
 
-    def solve_worker(self):
-        try:
-            result_data = self.calculate_solution()
-        except Exception as exc:
-            self.root.after(0, lambda error=exc: self.on_error(error))
-            return
-
-        self.root.after(0, lambda data=result_data: self.on_success(data))
-
-    def calculate_solution(self):
+    def read_problem_from_form(self):
         n = int(self.dim_entry.get())
 
         equation_strings = [entry.get() for entry in self.eq_entries]
@@ -636,198 +721,176 @@ class App:
 
         a = float(self.a_entry.get())
         b = float(self.b_entry.get())
-
-        if np.isclose(a, b):
-            raise ValueError("Концы интервала a и b не должны совпадать.")
+        t_star = float(self.t_star_entry.get())
 
         p0 = parse_float_list(
             self.p0_entry.get(),
             expected_size=n,
-            field_name="Начальное приближение p0",
+            field_name=self.tr("Начальное приближение p0"),
         )
 
         steps = int(self.steps_entry.get())
         max_iter = int(self.max_iter_entry.get())
         tolerance = float(self.tolerance_entry.get())
 
-        if steps < 2:
-            raise ValueError("Число шагов по параметру mu должно быть не меньше 2.")
-
-        if max_iter < 1:
-            raise ValueError("Максимальное число итераций должно быть не меньше 1.")
-
-        if tolerance <= 0:
-            raise ValueError("Точность должна быть положительным числом.")
-
-        ode_function, ode_jacobian_function = build_ode_functions(
-            equation_strings,
-            n,
-        )
-
-        boundary_residual, boundary_jacobian = build_boundary_functions(
-            boundary_condition_strings,
-            n,
-            a,
-            b,
-        )
-
-        def solve_inner_problem_with_sensitivity(p):
-            p = np.asarray(p, dtype=float)
-
-            identity_matrix = np.eye(n)
-            initial_state = np.concatenate([p, identity_matrix.reshape(n * n)])
-
-            def combined_rhs(t, state):
-                y = state[:n]
-                sensitivity = state[n:].reshape(n, n)
-
-                dy_dt = ode_function(t, y)
-                jacobian_f = ode_jacobian_function(t, y)
-
-                d_sensitivity_dt = jacobian_f @ sensitivity
-
-                return np.concatenate(
-                    [
-                        dy_dt,
-                        d_sensitivity_dt.reshape(n * n),
-                    ]
-                )
-
-            solution = solve_ivp(
-                combined_rhs,
-                (a, b),
-                initial_state,
-                t_eval=[a, b],
-                method="RK45",
-                rtol=1e-7,
-                atol=1e-9,
-            )
-
-            if not solution.success:
-                raise RuntimeError(
-                    f"Ошибка решения внутренней задачи Коши: {solution.message}"
-                )
-
-            ya = solution.y[:n, 0]
-            yb = solution.y[:n, -1]
-            sensitivity_b = solution.y[n:, -1].reshape(n, n)
-
-            return ya, yb, sensitivity_b
-
-        def phi_and_jacobian(p):
-            ya, yb, sensitivity_b = solve_inner_problem_with_sensitivity(p)
-
-            residual = boundary_residual(ya, yb)
-            jacobian_ya, jacobian_yb = boundary_jacobian(ya, yb)
-
-            phi_jacobian = jacobian_ya + jacobian_yb @ sensitivity_b
-
-            return residual, phi_jacobian
-
-        continuation_result = continuation_method_with_jacobian(
-            phi_and_jacobian,
-            p0,
+        return BVPProblem(
+            n=n,
+            equations=equation_strings,
+            boundary_conditions=boundary_condition_strings,
+            a=a,
+            b=b,
+            t_star=t_star,
+            p0=p0,
             steps=steps,
             max_iter=max_iter,
             tolerance=tolerance,
         )
 
-        p_solution = continuation_result.p
+    def solve_worker(self, problem):
+        try:
+            result_data = solve_bvp_by_continuation(problem)
+        except Exception as exc:
+            self.root.after(0, lambda error=exc: self.on_error(error))
+            return
 
-        t_grid = np.linspace(a, b, 300)
+        self.root.after(0, lambda data=result_data: self.on_success(data))
 
-        final_solution = solve_ivp(
-            ode_function,
-            (a, b),
-            p_solution,
-            t_eval=t_grid,
-            method="RK45",
-            rtol=1e-7,
-            atol=1e-9,
-        )
+    def redraw_current_solution(self):
+        if self.current_solution is not None:
+            try:
+                self.draw_solution(self.current_solution)
+            except Exception as exc:
+                messagebox.showerror(self.tr("Ошибка"), str(exc))
 
-        if not final_solution.success:
-            raise RuntimeError(
-                f"Ошибка построения итогового решения: {final_solution.message}"
-            )
-
-        return {
-            "t": final_solution.t,
-            "y": final_solution.y,
-            "p": p_solution,
-            "residual": continuation_result.residual,
-            "success": continuation_result.success,
-            "message": continuation_result.message,
-            "iterations": continuation_result.iterations,
-        }
-
-    def on_success(self, result_data):
-        self.current_solution = result_data
-        self.solve_button.config(state=tk.NORMAL)
-
-        t = result_data["t"]
-        y = result_data["y"]
-        p = result_data["p"]
-        residual = result_data["residual"]
-        iterations = result_data["iterations"]
-
-        residual_norm = np.linalg.norm(residual, ord=2)
+    def draw_solution(self, result_data):
+        t = result_data.t
+        y = result_data.y
 
         self.ax.clear()
+        self.ax.set_aspect("auto")
 
-        for i in range(y.shape[0]):
-            self.ax.plot(t, y[i], label=f"y{i + 1}(t)", linewidth=2)
+        plot_mode = self.plot_mode_var.get()
+        graph_color = self.get_graph_color()
 
-        # Убрана норма невязки из заголовка графика
-        self.ax.set_title("Решение")
-        self.ax.set_xlabel("t")
-        self.ax.set_ylabel("y")
+        if plot_mode == self.tr("Фазовый график"):
+            x_name = self.phase_x_var.get()
+            y_name = self.phase_y_var.get()
+
+            x_index = int(x_name[1:]) - 1
+            y_index = int(y_name[1:]) - 1
+
+            if x_index >= y.shape[0] or y_index >= y.shape[0]:
+                raise ValueError(
+                    f"{self.tr('Для системы размерности')} n={y.shape[0]} "
+                    f"{self.tr('нельзя выбрать')} {x_name} или {y_name}."
+                )
+
+            self.ax.plot(
+                    y[x_index],
+                    y[y_index],
+                    label=self.tr("траектория"),
+                    linewidth=2,
+                    color=graph_color,
+                )
+
+            self.ax.scatter(
+                y[x_index, 0],
+                y[y_index, 0],
+                marker="o",
+                s=60,
+                label="S",
+                color=graph_color,
+            )
+
+            self.ax.scatter(
+                y[x_index, -1],
+                y[y_index, -1],
+                marker="x",
+                s=70,
+                label="F",
+                color=graph_color,
+            )
+
+            self.ax.set_title(f"{self.tr('Фазовый график')} {y_name}({x_name})")
+            self.ax.set_xlabel(x_name)
+            self.ax.set_ylabel(y_name)
+            self.ax.axis("equal")
+
+        else:
+            for i in range(y.shape[0]):
+                self.ax.plot(
+                    t,
+                    y[i],
+                    label=f"y{i + 1}(t)",
+                    linewidth=2,
+                    color=self.get_component_color(i),
+                )
+
+            self.ax.set_title(self.tr("Компоненты решения"))
+            self.ax.set_xlabel("t")
+            self.ax.set_ylabel("y")
+
         self.ax.grid(True)
         self.ax.legend()
         self.figure.tight_layout()
         self.canvas_plot.draw()
 
+    def on_success(self, result_data):
+        self.current_solution = result_data
+        self.solve_button.config(state=tk.NORMAL)
+
+        p = result_data.p
+        residual = result_data.residual
+        iterations = result_data.iterations
+
+        residual_norm = np.linalg.norm(residual, ord=2)
+
+        self.draw_solution(result_data)
+        self.update_mu_table(result_data)
+
         p_text = ", ".join(f"{value:.8g}" for value in p)
 
-        if result_data["success"]:
+        if result_data.success:
             self.status_label.config(
                 text=(
-                    f"Готово. p = [{p_text}], "
-                    f"невязка = {residual_norm:.2e}, "
-                    f"итераций = {iterations}"
+                    f"{self.tr('Готово.')} p = [{p_text}], "
+                    f"{self.tr('невязка')} = {residual_norm:.2e}, "
+                    f"{self.tr('итераций')} = {iterations}, "
+                    f"t* = {result_data.t_star:g}"
                 )
             )
         else:
             self.status_label.config(
                 text=(
-                    f"Расчёт завершён с предупреждением. "
-                    f"Невязка = {residual_norm:.2e}"
+                    f"{self.tr('Расчёт завершён с предупреждением.')} "
+                    f"{self.tr('невязка')} = {residual_norm:.2e}"
                 )
             )
             messagebox.showwarning(
-                "Предупреждение",
-                result_data["message"]
+                self.tr("Предупреждение"),
+                result_data.message
                 + f"\n\np = [{p_text}]"
+                + f"\nt* = {result_data.t_star:g}"
                 + f"\n||Phi(p)|| = {residual_norm:.3e}"
-                + f"\nИтераций = {iterations}",
+                + f"\n{self.tr('Итераций')} = {iterations}",
             )
-    
+
     def on_error(self, error):
         self.solve_button.config(state=tk.NORMAL)
-        self.status_label.config(text="Ошибка.")
-        messagebox.showerror("Ошибка", str(error))
+        self.status_label.config(text=self.tr("Ошибка"))
+        messagebox.showerror(self.tr("Ошибка"), str(error))
 
     def save_graph(self):
         if self.current_solution is None:
             answer = messagebox.askyesno(
-                "Сохранение графика",
-                "Решение ещё не построено. Сохранить пустой график?",
+                self.tr("Сохранение графика"),
+                self.tr("Решение ещё не построено. Сохранить пустой график?"),
             )
             if not answer:
                 return
 
         filename = filedialog.asksaveasfilename(
-            title="Сохранить график",
+            title=self.tr("Сохранить график"),
             defaultextension=".png",
             filetypes=[
                 ("PNG image", "*.png"),
@@ -842,19 +905,128 @@ class App:
 
         try:
             self.figure.savefig(filename, dpi=300, bbox_inches="tight")
-            self.status_label.config(text=f"График сохранён: {filename}")
+            self.status_label.config(
+                text=f"{self.tr('График сохранён')}: {filename}"
+            )
         except Exception as exc:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить график:\n{exc}")
+            messagebox.showerror(
+                self.tr("Ошибка"),
+                f"{self.tr('Не удалось сохранить график')}:\n{exc}",
+            )
 
-    def show_about(self):
-        messagebox.showinfo(
-            "О программе",
+    def show_program_info(self):
+        program_text_ru = (
             "Решение краевых задач методом продолжения по параметру.\n\n"
             "Алгоритм:\n"
             "1. Краевая задача сводится к Phi(p)=0.\n"
-            "2. Решается внутренняя задача Коши для x(t,p).\n"
-            "3. Вместе с ней решается вариационная система для X(t,p).\n"
-            "4. Через X(b,p) строится Phi'(p).\n"
-            "5. Решается внешняя задача продолжения по параметру.\n\n"
-            "Автор: Ящук София, 313 группа.",
+            "2. Пользователь задаёт точку t* и параметр p = y(t*).\n"
+            "3. Решается внутренняя задача Коши для x(t,p).\n"
+            "4. Вместе с ней решается вариационная система для X(t,p).\n"
+            "5. Якобиан строится по формуле:\n"
+            "   Phi'(p) = R'_x X(a,p) + R'_y X(b,p).\n"
+            "6. Решается внешняя задача продолжения по параметру mu.\n"
+            "7. Во вкладке 'Таблица mu' выводятся значения p(mu).\n\n"
+            "В программе можно задавать систему ОДУ, граничные условия, "
+            "начальное приближение, строить графики и сохранять результат."
         )
+
+        if self.language == "en":
+            program_text = self.tr("О программе текст")
+        else:
+            program_text = program_text_ru
+
+        messagebox.showinfo(
+            self.tr("О программе"),
+            program_text,
+        )
+
+
+    def show_author_info(self):
+        author_window = tk.Toplevel(self.root)
+        author_window.title(self.tr("Об авторе"))
+        author_window.resizable(False, False)
+        author_window.transient(self.root)
+
+        main_frame = ttk.Frame(author_window, padding=16)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        photo_label = ttk.Label(
+            main_frame,
+            text=self.tr("Фото не найдено. Проверьте путь к файлу."),
+            width=30,
+            anchor="center",
+        )
+        photo_label.grid(row=0, column=0, rowspan=10, padx=(0, 18), pady=4)
+
+        try:
+            image = Image.open(AUTHOR_PHOTO_PATH)
+            image.thumbnail((180, 180))
+
+            self.author_photo_image = ImageTk.PhotoImage(image)
+
+            photo_label.config(
+                image=self.author_photo_image,
+                text="",
+                width=0,
+            )
+        except Exception:
+            photo_label.config(
+                text=self.tr("Фото не найдено. Проверьте путь к файлу.")
+            )
+
+        info_frame = ttk.Frame(main_frame)
+        info_frame.grid(row=0, column=1, sticky="nw")
+
+        ttk.Label(
+            info_frame,
+            text=self.tr("Об авторе"),
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(
+            info_frame,
+            text=f"{self.tr('Автор')}: Ящук София",
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            info_frame,
+            text=f"{self.tr('Группа')}: 313",
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            info_frame,
+            text=f"{self.tr('Почта')}: s02230029@gse.cs.msu.ru",
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            info_frame,
+            text=f"{self.tr('Год')}: 2026",
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            info_frame,
+            text=f"{self.tr('Преподаватели')}:",
+        ).pack(anchor="w", pady=(10, 2))
+
+        ttk.Label(
+            info_frame,
+            text="Аввакумов Сергей Николаевич",
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            info_frame,
+            text="Орлов Сергей Михайлович",
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            info_frame,
+            text=f"{self.tr('Проект')}: "
+                f"{self.tr('Решение краевых задач методом продолжения')}",
+            wraplength=360,
+        ).pack(anchor="w", pady=(10, 2))
+
+        ttk.Button(
+            info_frame,
+            text=self.tr("Закрыть"),
+            command=author_window.destroy,
+        ).pack(anchor="w", pady=(16, 0))
