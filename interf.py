@@ -37,6 +37,7 @@ plt.rcParams.update({"font.size": 11})
 
 
 class App:
+    #объект приложения(хранятся данные-окно,язык, результат)
     def __init__(self, root):
         self.root = root
         self.language = "ru"
@@ -197,6 +198,7 @@ class App:
 
         self.root.config(menu=menubar)
 
+    #создается кнопка решить
     def create_layout(self):
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -390,7 +392,7 @@ class App:
             "<<ComboboxSelected>>",
             lambda event: self.redraw_current_solution(),
         )
-
+        #вызывается метод star_solving
         self.solve_button = ttk.Button(
             self.scroll_frame,
             text=self.tr("Решить задачу"),
@@ -689,6 +691,7 @@ class App:
     def load_example_three_body(self):
         self.load_example(get_example_three_body())
 
+    #блокирует кнопку и хапускает вычисление в отдельном потоке
     def start_solving(self):
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showinfo(
@@ -696,7 +699,7 @@ class App:
                 self.tr("Расчёт уже выполняется."),
             )
             return
-
+        #формируем объект BVP
         try:
             problem = self.read_problem_from_form()
         except Exception as exc:
@@ -706,6 +709,7 @@ class App:
         self.solve_button.config(state=tk.DISABLED)
         self.status_label.config(text=self.tr("Идёт расчёт..."))
 
+        #cоздаём отдельный поток для решения задачи
         self.worker_thread = threading.Thread(
             target=self.solve_worker,
             args=(problem,),
@@ -713,6 +717,7 @@ class App:
         )
         self.worker_thread.start()
 
+    #собираем все данные чтобы передать в solver
     def read_problem_from_form(self):
         n = int(self.dim_entry.get())
 
@@ -746,13 +751,14 @@ class App:
             tolerance=tolerance,
         )
 
+    #вызывает метод решения краевой задачи из solver
     def solve_worker(self, problem):
         try:
             result_data = solve_bvp_by_continuation(problem)
         except Exception as exc:
             self.root.after(0, lambda error=exc: self.on_error(error))
             return
-
+        #безопасно обновляем окно
         self.root.after(0, lambda data=result_data: self.on_success(data))
 
     def redraw_current_solution(self):

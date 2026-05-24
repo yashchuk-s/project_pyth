@@ -6,6 +6,7 @@ from parser import (
     build_ode_functions,
     build_boundary_functions,
 )
+# проверят кооректность перевода, правую часть и якобиан
 
 def test_parse_float_list_correct_input():
     result = parse_float_list("1, 2.5, -3", expected_size=3)

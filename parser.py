@@ -10,7 +10,7 @@ from sympy.parsing.sympy_parser import (
     convert_xor,
 )
 
-
+#y^2,y**2
 TRANSFORMATIONS = standard_transformations + (
     implicit_multiplication_application,
     convert_xor,
@@ -37,7 +37,7 @@ def get_allowed_functions():
         "E": sp.E,
     }
 
-
+#превращает р0 в список чистит пробелы и ставит запятые
 def parse_float_list(text, expected_size=None, field_name="список"):
     try:
         values = [float(item.strip()) for item in text.split(",") if item.strip()]
@@ -52,7 +52,7 @@ def parse_float_list(text, expected_size=None, field_name="список"):
 
     return np.asarray(values, dtype=float)
 
-
+# разбирает правую часть ОДУ, проверяет на допустисые функции
 def build_ode_functions(equation_strings, n):
     t_symbol = sp.Symbol("t")
     y_symbols = sp.symbols(f"y1:{n + 1}")
@@ -94,30 +94,31 @@ def build_ode_functions(equation_strings, n):
 
         expressions.append(expression)
 
+    #Построение якобиана ОДУ
     vector_expression = sp.Matrix(expressions)
     jacobian_expression = vector_expression.jacobian(y_symbols)
-
+    #lambdify превращает символьные выражения в численные функции
     numeric_f = sp.lambdify((t_symbol, *y_symbols), expressions, "numpy")
     numeric_jacobian = sp.lambdify(
         (t_symbol, *y_symbols),
         jacobian_expression,
         "numpy",
     )
-
+    #численно вызываем правую часть ОДУ
     def f(t, y):
         values = numeric_f(t, *y)
         return np.asarray(values, dtype=float).reshape(n)
-
+    #численно вычисляем якобиан
     def f_jacobian(t, y):
         values = numeric_jacobian(t, *y)
         return np.asarray(values, dtype=float).reshape(n, n)
 
     return f, f_jacobian
 
-
+#переводим граничные условия 
 def replace_boundary_variables(expression, a, b, n):
     pattern = r"y(\d+)\s*\(\s*([^)]+)\s*\)"
-
+    #y1(a) → ya1
     def replacement(match):
         variable_index = int(match.group(1))
         point = match.group(2).strip()
@@ -155,7 +156,7 @@ def replace_boundary_variables(expression, a, b, n):
 
     return re.sub(pattern, replacement, expression)
 
-
+#превращает текстовые граничные условия из интерфейса в численные функции для solver
 def build_boundary_functions(boundary_condition_strings, n, a, b):
     if len(boundary_condition_strings) != n:
         raise ValueError(
@@ -251,11 +252,12 @@ def build_boundary_functions(boundary_condition_strings, n, a, b):
         "numpy",
     )
 
+    #невязка граничных условий
     def boundary_residual(ya, yb):
         args = list(ya) + list(yb)
         values = numeric_residual(*args)
         return np.asarray(values, dtype=float).reshape(n)
-
+    #производные граничных условий(dR/dy(a))
     def boundary_jacobian(ya, yb):
         args = list(ya) + list(yb)
 

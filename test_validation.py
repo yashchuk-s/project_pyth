@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from solver import BVPProblem, validate_problem
-
+#проверка корректности данных в solver
 
 def make_valid_problem():
     return BVPProblem(

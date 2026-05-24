@@ -63,7 +63,7 @@ class BVPSolution:
     t_star: float
     continuation_history: list
 
-
+#Внешняя задача ищет p по mu, при котором Phi(p) = 0
 def continuation_method_with_jacobian(
     phi_and_jacobian,
     p0,
@@ -92,8 +92,10 @@ def continuation_method_with_jacobian(
     mu_grid = np.linspace(0.0, 1.0, steps)
     max_step_mu = 1.0 / (steps - 1)
 
+    #p(mu)
     history = []
 
+    #цикл вншних итераций(строит Ф(р), считает невязку, доходит до mu=1)
     for iteration in range(1, max_iter + 1):
         phi_start, _ = phi_and_jacobian(p)
         phi_start = np.asarray(phi_start, dtype=float)
@@ -127,8 +129,9 @@ def continuation_method_with_jacobian(
                 history=history,
             )
 
+        # правая часть внешней задачи Коши по μ
         def continuation_rhs(mu, current_p):
-            _, jacobian = phi_and_jacobian(current_p)
+            _, jacobian = phi_and_jacobian(current_p)#Ф'(p)
 
             jacobian = np.asarray(jacobian, dtype=float)
 
@@ -139,6 +142,7 @@ def continuation_method_with_jacobian(
                 )
 
             try:
+                #dp/dmu=-Ф'(p)^-1 *Ф(p0)
                 dp_dmu = -solve(jacobian, phi_start, assume_a="gen")
             except Exception as exc:
                 raise RuntimeError(
@@ -150,12 +154,13 @@ def continuation_method_with_jacobian(
             return dp_dmu
 
         try:
+            #решение внешней задачи по mu
             solution = solve_ivp(
-                continuation_rhs,
+                continuation_rhs, #-Ф'(p)^-1 *Ф(p0)
                 (0.0, 1.0),
                 p,
                 t_eval=mu_grid,
-                method="RK45",
+                method="RK45",  # метод Рунге-Кутты
                 rtol=rtol,
                 atol=atol,
                 max_step=max_step_mu,
@@ -180,10 +185,12 @@ def continuation_method_with_jacobian(
                 history=history,
             )
 
+        #проходим по всем сохранненым точкам mu и сохраняем итерацию значение и p(mu)
         for column_index, mu_value in enumerate(solution.t):
             if column_index == 0 and np.isclose(mu_value, 0.0):
                 continue
-
+            
+            #сохраняем новое приближение последней точки
             p_value = solution.y[:, column_index]
 
             history.append(
@@ -196,6 +203,7 @@ def continuation_method_with_jacobian(
 
         p = solution.y[:, -1]
 
+        #прверяем невязку нового p
         residual, _ = phi_and_jacobian(p)
         residual = np.asarray(residual, dtype=float)
         residual_norm = np.linalg.norm(residual, ord=2)
@@ -222,7 +230,7 @@ def continuation_method_with_jacobian(
         history=history,
     )
 
-
+#проверка коректности данных
 def validate_problem(problem):
     if problem.n <= 0:
         raise ValueError("Размерность n должна быть натуральным числом.")
@@ -253,7 +261,7 @@ def validate_problem(problem):
     if problem.tolerance <= 0:
         raise ValueError("Точность должна быть положительным числом.")
 
-
+#проверяет правильность данных строит оду и гран условия, создает внутреннюю задачу и запускает внешний метод
 def solve_bvp_by_continuation(problem):
     validate_problem(problem)
 
@@ -263,11 +271,13 @@ def solve_bvp_by_continuation(problem):
     t_star = float(problem.t_star)
     p0 = np.asarray(problem.p0, dtype=float)
 
+    #f(t,y)- правая часть системы, f_y(t,y) матрица производных
     ode_function, ode_jacobian_function = build_ode_functions(
         problem.equations,
         n,
     )
 
+    #R(y(a),y(b)) , R'(y(a)), R'(y(b))
     boundary_residual, boundary_jacobian = build_boundary_functions(
         problem.boundary_conditions,
         n,
@@ -275,10 +285,11 @@ def solve_bvp_by_continuation(problem):
         b,
     )
 
+    #Внутреняя задача для данного p решить систему по t
     def solve_inner_problem_with_sensitivity(p):
         p = np.asarray(p, dtype=float)
 
-        identity_matrix = np.eye(n)
+        identity_matrix = np.eye(n) #E
         initial_state = np.concatenate(
             [
                 p,
@@ -288,13 +299,16 @@ def solve_bvp_by_continuation(problem):
 
         def combined_rhs(t, state):
             y = state[:n]
+            #X(t,p)=dy/dp
             sensitivity = state[n:].reshape(n, n)
 
             dy_dt = ode_function(t, y)
             jacobian_f = ode_jacobian_function(t, y)
 
+            #X'=f'_y*X
             d_sensitivity_dt = jacobian_f @ sensitivity
 
+            # Возвращаем общий вектор производных
             return np.concatenate(
                 [
                     dy_dt,
@@ -302,6 +316,7 @@ def solve_bvp_by_continuation(problem):
                 ]
             )
 
+        #интегрируем внутренную задачу от t*
         def integrate_to(target, target_name):
             if np.isclose(target, t_star):
                 return p.copy(), identity_matrix.copy()
@@ -334,16 +349,20 @@ def solve_bvp_by_continuation(problem):
 
         return ya, yb, sensitivity_a, sensitivity_b
 
+    #Считает Ф(р), Ф'(p)
     def phi_and_jacobian(p):
         ya, yb, sensitivity_a, sensitivity_b = solve_inner_problem_with_sensitivity(p)
 
+        # Phi(p) = R(y(a,p), y(b,p)).
         residual = boundary_residual(ya, yb)
         jacobian_ya, jacobian_yb = boundary_jacobian(ya, yb)
 
+        # Phi'(p) = R_ya * X(a,p) + R_yb * X(b,p).
         phi_jacobian = jacobian_ya @ sensitivity_a + jacobian_yb @ sensitivity_b
 
         return residual, phi_jacobian
 
+    # Запускаем внешний метод продолжения по параметру mu и ищет Ф(р)=0
     continuation_result = continuation_method_with_jacobian(
         phi_and_jacobian,
         p0,
@@ -356,6 +375,7 @@ def solve_bvp_by_continuation(problem):
 
     p_solution = continuation_result.p
 
+    # По найденному p получаем значение решения в левом конце интервала.
     ya, _, _, _ = solve_inner_problem_with_sensitivity(p_solution)
 
     t_grid = np.linspace(a, b, problem.output_points)

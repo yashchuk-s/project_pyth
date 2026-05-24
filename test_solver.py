@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from solver import BVPProblem, solve_bvp_by_continuation
-
+#gпроверка функции solve_bvp_by_continuation(problem) в solver
 
 def test_harmonic_oscillator_bvp():
     problem = BVPProblem(
